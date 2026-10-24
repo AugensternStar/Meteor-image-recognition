@@ -1,0 +1,462 @@
+
+# Update Log
+
+## Todo List
+
+P0:
+* 天区解析
+* 视频拼接错误排查
+* 飞机分类算法问题
+add a frame2frame mode under image analyzing mode.
+* 导出得分设置
+干净的cuda支持【TensorRT？】
+简单的GUI页面
+统计工具
+自动化的天地分割。
+反差提升YOLO
+TODO: pyexiv2 pkging.
+* 相机直录表现差
+* 低fps表现差
+* "焦距"配置
+-----
+* 导出
+    * 支持导出gif
+
+* 模型训练和推理
+    * 需要一个稳健的照片检测模型（选用高质量训练样本）
+    * TTA框架开发（？）
+    * 精灵上色重训练，减少黑白样本影响
+
+* BUG排查
+    * PyAV loader行为diff（和opencv行为不一致）
+
+* 使用体验优化
+    * 配置错误提示优化
+
+* 检测外机制优化
+    * 亮度突变优化
+        1.天亮/天暗时的亮度突变过滤；
+        2.火流星等直接炸屏的场景检出
+
+1. 实时模式
+    1. 支持直接使用流数据源输入，如RTMP/RTSP
+    2. 支持断连和自动重连功能
+    3. 支持流式的fps估算（代替目前的采样估算）
+2. 检测效果（正负样本筛选）
+    1. 引入对轨迹的序列描述特征（如通过抽样得到序列），排除飞虫类/云类非规则运动。
+    2. 改善检测卫星等飞行器是容易断线的不连续性问题（可能需要对检测底层机制进行修改）。
+    3. 对于传统过滤器，引入简单分类器（如SVM或ANN）代替目前的特征阈值卡控机制。
+    4. 继续微调检测模型以改善准确率(增训，微调)，细化精灵类标注，增加对其他天象（如闪电）的支持。
+    5. 感知未知类型（即非干扰但也非目标的检测结果,常见于各类再入，不在分类器中的大气现象等）的现象并记录。
+    6. 使模型检测器输出带上流星方向信息，为后续迭代建设基础。
+    7. 对噪声估计不准确的场景引入自动化微调参数，改善该类型场景对暗弱流星的检测。
+    8. 优化/修复大面积类响应被忽略的问题。
+    9. 添加"焦距"配置，为鱼眼/长焦的流星视频的判据提供修正值。
+    10. 添加指示亮度的参数项。
+    11. 接入最小二乘损失项作为特征。
+    12. 低反差目标？
+    13. 对特大目标的检测效果确认。
+    14. 相机直录表现差
+    15. 低fps表现差
+3. 检测性能
+    1. 简化迭代中产生的冗余检测后处理机制（如DyMask， MeteorLib中的冗余逻辑），提升检测性能。
+    2. 构建直接使用差值代替线段检测的高速检测器，降低计算量，并预期能改善城市场景卫星/飞机的问题。
+    3. 将计算复杂的模块使用cython等实现，改善性能
+4. 功能扩展
+    1. 接入对其他深度学习框架和模型的支持
+    2. 添加天区解析功能，为支持快速叠图，分析辐射点，流星组网监测提供基础支持
+    3. 支持导出UFO Analizer格式的文本，用于流星组网联测等需求
+5. bugfix
+    1. 单帧长度指定大于窗口允许时，差值不生效问题（部分相机可能取到低值）。
+    3. 部分视频片段的fps问题
+    
+6. 其他杂项优化
+    1. 日志中的error需要写到stderr中去。
+    2. 其他代码中的TODO项
+
+Note:
+1. 炸屏优化（1. 天亮/天暗时的亮度突变过滤；2.火流星等直接炸屏的场景检出）
+2. 飞行器/大面积时间不容易被后验检测器检出。
+3. 改善报错信息（尤其是配置文件）
+
+## Version 2.6.1
+
+✅ BugFix
+* 修复 v2.5.0 引入的深度学习候选过滤回归：恢复 NMS 前独立的 objectness 门槛，避免低 objectness 候选因类别分数较高而通过筛选；恢复 `pos_thre` 的旧版语义，默认值恢复为 `0.25`。新增 `objectness_thre` 配置独立控制，默认值为 `0.25`；
+* 修正 `m3det_normal_old.json` 的预设名称。
+* 打包工具优化：完善 Nuitka 发行版本的动态依赖，收紧 PyInstaller 的依赖收集，减小发行版体积。
+
+⚠️ Configuration Migration Notes
+* 建议更新为本版本提供的预设。默认设置为 `objectness_thre=0.25`、`pos_thre=0.25`，分别约束 objectness 和开平方后的模型分数。
+* 如果希望继续使用 v2.5.0 / v2.6.0 原始联合分数门槛的配置，需要将 `pos_thre` 换算为原值的平方根：例如原值 `0.10` 应改为约 `0.316227766`。
+
+**Full Changelog**: https://github.com/LilacMeteorObservatory/MetDetPy/compare/v2.6.0...v2.6.1
+
+## Version 2.6.0
+
+✅ New Feature(s)
+* `MetDetPhoto`
+    * 支持通过 `@清单文件` 输入一批图像；相对路径以清单目录为基准。
+    * 文件夹、图像清单和延时视频支持多设备并行推理，可自动使用全部可用 DML GPU，或显式组合 GPU、CPU 和 CoreML 后端。
+    * 新增 `--list-devices` 查看 DML 设备；新增 `--device` 和 `--num-threads` 控制推理设备及 CPU 线程数。
+* 模型与设备配置
+    * 支持通过 `dml:N`、`cuda:N` 指定显卡索引；模型配置新增 `num_threads`，控制 ONNX Runtime CPU 推理内部的并行线程数。
+    * 新增 FP16 模型权重和 `config/dldet_fp16.json` 预设，提供速度优先的选择。（检测结果可能有轻微差异(<1%>)。）
+* 评估工具 `evaluate`
+    * 支持通过 `--manifest` 顺序评估多个视频和配置，使用 `--passes` 在独立进程中重复运行。
+    * 支持保存分类指标、PR 数据和差异结果，汇总耗时、CPU、内存及多轮性能的中位数、最小值和最大值。
+* 性能与差异分析工具
+    * `MetDetPy` 新增 `--profile`，可查看视频读取、预处理、队列等待、检测、收集和模型推理等阶段的耗时。
+    * 新增照片综合差异报告工具，统一统计精确一致性、分数与定位残差，以及阈值过滤后的感知差异。
+    * 新增照片 Diff 图导出，共同预测用淡灰框显示，突出变化和未匹配目标。
+
+✅ Improvement
+* `M3Det-通用` 默认使用 FP16 模型作为速度优先配置，保留 FP32 输入。
+* 优化 M3 检测中的滑动窗口、均值与动态掩模计算，减少逐帧数组分配和不必要的最大值维护。
+* 将线段合并中的距离与宽度计算改为批量运算，保留原有贪心顺序与合并判据。
+* PyAV 在视频帧间复用 BGR 转换器，减少重复创建转换上下文及工作线程的开销。
+* ONNX 推理改为按设备共享锁，同一设备串行、不同显式设备可并行；同一进程禁止混用自动 DML 和显式 DML 索引。
+
+✅ BugFix
+* 修复模型获取锁超时后仍执行推理并释放未持有锁的问题；跳过的推理会记录日志。
+* 修复视频加载器释放时生产线程可能仍在运行、队列阻塞或残留帧未清理的问题。
+* 修复日志输出失败后日志线程退出的问题，输出异常时改用 stderr，并在停止时等待队列处理完毕。
+* 修复部分视频使用保留值色彩元数据时，PyAV / FFmpeg 的 BGR 转换失败问题。
+* 修复视频结果回归对输入目标顺序的依赖，以及将旧检测报告的低分目标错误视为人工标注中的 `DROPPED` 的问题；完善漏检统计与差异输出。
+* 修复 Windows Python 3.13+ 下指定 MinGW64 导致 Nuitka 打包失败的问题，自动改用 MSVC。
+* 修复 Nuitka 目录发行包缺少 PyAV 动态依赖，以及 pyexiv2 原生扩展和共享库的加载路径问题。
+* 收紧 PyInstaller 依赖收集，移除不必要的 Pillow 隐式导入，排除绘图、训练、交互式开发和 Qt 等可选依赖。
+
+⚠️ Compatibility and Performance Notes
+* `M3Det` 的默认模型已变化，阈值附近的分数和保留结果可能出现轻微差异；需要沿用全精度模型时，可回退使用 `m3det_normal_old.json`。
+* 自动多 GPU 不默认加入 CPU；显式混用 CPU 时，照片入口默认使用逻辑处理器数的四分之一。。
+* 常用检测预设的 `continue_on_err` 默认改为 `true`，读取失败时记录日志并继续；需要遇错停止时可自行关闭。
+* 多 GPU、CPU 混用和 FP16 的收益取决于设备与输入。
+
+✅ Documents and Tests
+* 更新中英文设备选择、CPU 线程配置、照片清单和多设备推理使用说明，补充照片差异报告文档与本机性能实验记录。
+* 新增批量评估、分类指标、照片残差与感知差异、Diff 图导出、设备发现、并行调度和锁冲突测试。
+* 新增性能分析、滑动窗口、M3 缓冲区、线段合并和 PyAV 转换兼容性测试。
+
+**Full Changelog**: https://github.com/LilacMeteorObservatory/MetDetPy/compare/v2.5.0-rc...v2.6.0
+
+## Version 2.5.0
+
+✅ New Feature(s)
+* `MetDetPy`
+    * 视频加载配置新增硬件解码选项，可将支持的硬件加速参数传递给视频解码后端。
+    * 检测结果新增 `drct_cv` 字段，以圆方差描述目标运动方向的稳定程度。
+* `ClipToolkit`
+    * 新增 `--padding-before` 和 `--padding-after`，可以在目标片段前后保留指定时长的画面。
+    * 视频导出支持使用类别、得分和长度过滤规则，并可通过 `--enable-filter-rules` 或 `--disable-filter-rules` 覆盖配置文件开关。
+* 可视化组件
+    * 新增 `TimeSeriesChartVisu`，支持在调试画面中持续绘制指定指标的时序曲线。
+* 打包工具
+    * 将 Nuitka 和 PyInstaller 统一到 `make_package.py`，可通过 `--backend` 选择打包后端。
+    * 完善 onefile 模式支持；打包脚本会把 `config/`、`weights/` 和 `global/` 自动复制到可执行文件旁。
+
+✅ Improvement
+* 将模型复检从片段级调整为目标级，同一片段中的目标可以分别复检、分类和保留；同时增加复检前后留白与独立阈值配置。
+* 重构流星序列收集与导出流程，由 Exporter 统一处理确认队列、片段边界和相邻片段合并，减少边界状态重复维护。
+* 增加 `clip_merge_interval`，允许单独控制已确认目标合并为同一输出片段的时间间隔。
+* 流星评分缓存改为跟随 `MeteorSeries` 对象生命周期，避免全局缓存残留及对象 ID 复用造成的错误命中。
+* 优化 PyAV 对可变帧率视频、帧缓存和重复解码帧的处理，改为按输入 PTS 重采样到稳定 CFR 时间线，并为异常低帧率增加提示。
+* sRGB ICC 配置改为内置资源，导出图片不再依赖外部 `resource/sRGB.icc` 文件。
+* 简化视频加载器实现，移除未使用且稳定性较差的 `ProcessVideoLoader`。
+
+✅ BugFix
+* 修复检测起始帧、结束帧、片段边界和视频尾部目标可能出现的偏移、遗漏或重复输出问题。
+* 修复模型复检失败后的目标排序、复检时长计算和裁剪画面显示问题。
+* 修复视频加载线程结束哨兵及异常退出路径可能造成的等待或强制退出问题。
+* 修复 `ClipToolkit` 前后留白的时间边界，以及视频模式下过滤规则未正确作用于单个目标的问题。
+* 修复 `MetDetPhoto` 部分图像尺寸记录和类别名称映射问题。
+* 修复空 ROI 和梯度方向为非法值时的检测框方向修正崩溃问题。
+* 修复模型推理时的通道顺序和输入规范，修复NMS阶段的合并阈值，更改为类别NMS
+* 修复 onefile 模式的资源相对路径、输出目录、Windows spec 路径、ZIP 内容为空，以及多个独立 EXE 错误共享依赖的问题。
+
+⚠️ Compatibility and Performance Notes
+* 历史 MDRF 文件可以缺少 `drct_cv`；读取时该字段使用 `null`，不影响旧数据加载。
+* 配置项 `thre2` 更名为 `merge_dist_sqr`。旧字段仍可兼容读取，但已经弃用；新增的 `recheck_threshold` 和 `clip_merge_interval` 均为可选项。
+* onefile 发行包会从可执行文件所在目录查找资源。`--resource-dir` 已移除。
+* 原独立的 `make_package_pyinstaller.py` 已移除，请改用 `make_package.py --backend pyinstaller`。
+* YOLO 原始 NMS 阈值语义和默认值已变化，升级自定义配置时建议重新校准 `pos_thre`。
+* 单响应进入 recheck 可能会显著增加模型调用次数和完整视频运行时间。
+
+
+✅ Documents and Tests
+* 重组并补充中英文工具、配置和 MDRF 数据格式文档。
+* 新增图片输入与 YOLO、ROI 梯度、PyAV PTS/seek、音视频混流以及整体稳定性回归测试。
+* 增加收集器、Exporter、旧数据兼容、时序图和 onefile 打包稳定性测试。
+
+**Full Changelog**: https://github.com/LilacMeteorObservatory/MetDetPy/compare/v2.4.0...v2.5.0-rc
+
+## Version 2.4.0
+
+✅ New Feature(s)
+* `MetDetPy`
+    * 正样本结果增加 `relative_brightness` 特征，无量纲，用于表示该样本相对背景的亮度。
+    * 正样本结果增加 `aesthetic_score` 特征，无量纲，用于表征样本的观赏性。结合样本的长度，亮度和置信度计算。
+* `MetDetPhoto`
+    * 支持直接读取主流数码相机的 RAW 格式文件（如 `.NEF`, `.CR2`, `.ARW`, `.DNG` 等）。读入后，图像将被应用自动的亮度拉伸和白平衡以进行检测。
+    * 文件夹检测模式下，支持多线程读取图像，优化了图像加载和检测速度。
+    * 序列检测模式下，检测结果将流式输出。
+* `ClipToolkit`
+    * 在处理 `MDRF` 格式输入时，增加了过滤器：可以限制输出类别、得分和长度约束，从而快速筛选正样本（默认关闭，自行在配置中开启）。
+    * 支持了包含 RAW 格式的 `MDRF` 文件的导出功能。
+    * 新增 `FFMpegVideoWriter`，在自行配置本地 FFMpeg 和 FFProbe 路径后可以支持导出常见编码的常见视频格式（如h264编码的mp4）。
+    * 支持截取视频模式下的 `--with-bbox` 选项，将在流星位置绘制一个包围框。
+
+✅ Improvement
+* `MetDetPy`
+    * `DLDet` 的单帧检测结果增加了方向信息，优化了方向计算结果。
+
+* `ClipToolkit`
+    * 增强导出标注框（启用 `--with-bbox` 时）的视觉效果，标注框增加标签和概率得分，并可以为各个类别设置颜色。
+    
+
+✅ BugFix
+* 修复了 `MetDetPhoto` 在可视化模式下标注框错位问题。
+* 修复了 `MetDetPhoto` 保存 `MDRF` 格式输出时文件名可能受到输入路径格式影响导致空文件名的问题。
+* 修复了 `ClipToolkit` 执行保存带 labelme 标注时缺少导出文件名导致失败的问题。
+
+## Version 2.3.2
+
+✅ Improvement
+* 增加了 Git-LFS 托管的网络权重格式检查。
+
+✅ Bug fixes
+* 为 `PyAVVideoWrapper` 增加了帧缓存机制，优化了一次解码多帧时的帧丢弃情况。
+* 完善了 `PyAVVideoWrapper` 的错误捕获机制，减少偶发错误导致的强行终止问题。
+* 修复了 `YOLOModel` 推理错误时的兜底格式化错误。
+* 为 `YOLOModel` 增加了线程锁以优化稳定性。
+
+✅ Documents
+* 更新了[数据格式](./data-format.md)和[工具](./tool-usage.md)的文档。
+* 在[配置文档](./config-doc.md)补充了[裁剪工具](../ClipToolkit.py)的配置说明。
+
+**Full Changelog**: https://github.com/LilacMeteorObservatory/MetDetPy/compare/v2.3.1...v2.3.2
+
+
+## Version 2.3.1
+
+✅ Improvement
+* 为 `VideoLoader` 添加 `continue_on_err` 选项，设置为 `true` 时会在帧数据解析失败时继续尝试向后解析[1]。
+*  `ClipToolkit` 生成截图失败时，会在 `stderr` 抛出 fatal error，便于定位问题。
+* 冗余代码优化。
+
+⚠️1：该设置可能不能改善缺失关键帧索引造成的连续读取失败。如果您的视频频繁出现大量失败，请优先尝试重新封装视频：
+```ffmpeg -i input.mp4 -c copy -map 0 fixed.mp4```。
+
+✅ BugFix
+* 修复了数个配置文件键值错误问题。
+* 修复部分情况下 `np.int32` 类型数据导致的序列化失败问题。
+* 延长了 `metlog` 组件允许的最长等待时间，优化可能的输出不完整问题。
+
+
+## Version 2.3.0
+
+✅ New Feature(s)
+1. 新增视频解码后端 `PyAVVideoWrapper` ，并替代`OpenCVVideoWrapper`作为默认视频解码后端。相比`OpenCVVideoWrapper`，`PyAVVideoWrapper`在跳转准确性和稳定性上表现更好，改善读取时间索引错位视频的准确性，同时修复了视频切片和重校验的时间错位问题。
+
+2. 为 `ClipToolkit` 新增 `--denoise` 选项，支持在导出图像时降低图像背景噪声水平，同时连接图像中前景目标可能存在的断线。可以指定 `simple` （对最大值图像简单降噪）或者 `mfnr-mix` （使用“最大值-平均值混合”叠加算法的多帧降噪）两种降噪算法*。
+
+
+⚠️ *：`simple` 是使用双边滤波的传统降噪算法，运行较快；`mfnr-mix`是混合多帧降噪结果的视频降噪算法，效果更好，但耗时更长（通常慢于直接叠加5倍以上），适用于需要导出较高画质的场合。
+
+✅ Improvement(s)
+1. `ClipToolkit` 在保存图像时，会嵌入 `sRGB` 色彩配置文件。
+
+✅ Bug Fixed
+1. 修复命令行直接调用`ClipToolkit`的`--save-path`时，会忽略格式直接新建文件夹的问题。
+2. 修复`ClipToolkit`绘制包围框时的效果问题。
+3. 修复`MetDetPy`在重校验失败时直接跳过输出片段的问题。
+4. 修复`MetDetPy`在重校验时可能会无法生成截图的问题。
+5. 修复`MetDetPy`在调用深度学习模型时可能出现非预期错误导致检测终止的问题。
+6. 修复 `MetDetPhoto` 检测单张照片时可视化的问题。
+
+✅ Code Formatting
+1. 引入 `typing` 规范类型注解和静态类型检查。
+2. 引入 `dacite` 管理配置文件规范和参数解析。
+
+## Version 2.2.0
+
+✅ New Feature(s)
+
+1. 更新默认检测模型为 `yolov5s_v2.onnx`，改善卫星线等场景的准确率，并支持了飞虫、喷流等更多检测类别。
+2. 重构并完善用于图像检测的工具入口 `MetDetPhoto`。该工具现可用于单张照片，延时序列或者延时序列构成的视频检测。
+3. `Model` 相关配置项支持多尺度推理相关设置，可以改善小目标召回率。
+4. 正式定义流星检测结果格式(MDRF)作为MetDetPy的流转文件格式，增加各脚本的通用性。该格式文件可以手动创建（作为标注），从检测/评估工具导出，或作为评估和切片工具的输入。有关该脚本的更多介绍见[工具文档](./tool-usage-cn.md)/[Tool Usage](./tool-usage.md)。`MetDetPy` 和 `MetDetPhoto` 可以输出MDRF文件，而`ClipToolkit` 和 `evaluate` 则可以接受MDRF文件的输入。
+
+✅ Improvement(s)
+
+1. 调整了重校验阈值与最终预测的得分的计算方式，改善了非直线目标（如红色精灵等大气现象）的召回性能。
+2. 改进了 `ClipToolkit` 的易用性，主要优化点有：（1）提供了简化的调用接口，支持了无参数（完整视频）及单张截图时的参数；（2）允许同时保存Labelme格式标注；（3）支持保存带标注框的图像；（4）导出视频时以流式保存，避免内存溢出。
+3. 调整了后端模式下的输出逻辑，未被分类为正样本的检测结果也会在后端输出（同样以 Meteor 开头）。
+4. 增加了归一化的速度(fix_speed)，距离(fix_dist)，持续时间(fix_duration)和持续运动时间(fix_motion_duration)的统计值输出，为统计值在不同设备上的统计范围提供了统一参考。
+5. 优化了 `evaluate` 工具接受的参数列表，完善了回归测试与性能测试的数据格式和基线。
+6. 调整保存到检测结果文件的坐标与格式更改为与命令行输出一致（即视频原始分辨率下的坐标）,提高输出结果易用性。
+
+✅ Bug Fixed
+
+1. 使用归一化的速度统计值进行流星置信区间的判定，预期改善对于卫星和飞机的误判。
+
+⚠️ 本次更新对默认参数范围有较大变动，使用从先前版本复制的自定义配置文件可能在新版本不适用，建议用户参考参数解释页手动更新配置文件。
+
+
+## Version 2.1.0
+
+✅ New Feature(s)
+1. 为发行版引入 `onnxruntime_directml`，修复 onnxruntime 在 windows 平台不支持使用GPU的问题，缓解CPU负载。
+2. 新增 `--live-mode` 选项，开启该选项可使检测速度与视频时长能够基本持平，均衡CPU负载，适用于直播场景。
+3. 新增 `--save` 选项，允许保存运行结果到json文件。
+
+✅ Improvement(s)
+1. 更新了评估工具`evaluate.py`，更改了评估标注格式，支持保存结果，与其他版本比较性能和效果等。该结果可作为回归测试与性能测试的基准，以确保迭代间的性能和效果稳定性。
+
+⚠️ 提供了 `--provider cpu` 以指定CPU运行模型，如果在未安装 DirectX 12的电脑上使用 `onnxruntime_directml` 造成报错，可以作为降级方案。
+
+✅ Bug Fixed
+1. 为Stacker增加出错兜底逻辑，修复Stacker在特定场景下报错会导致序列后续无输出的问题。
+2. 修复了2.0.1版本因为动态模板机制出错产生的效果差异。
+3. 通过放宽重校验机制，临时修复了对可能火流星的误报。后续会对该类问题给出更稳健的解决方案。
+
+⚠️ Revert
+1. 回滚了2.0.2版本中有关动态间隔机制的改动，维持效果一致性。该机制的下线还需要进一步测试。
+
+
+## Version 2.0.2
+
+✅ Modification
+* 修改了响应合并逻辑及输出概率的计算逻辑，改进了输出的预测概率。
+* 更改了后处理阶段的线段合并机制。
+* 下线了动态间隔机制。
+
+✅ Improvement(s)
+* 为loader增加了“曝光时间上限”（upper_bound）选项（非必须项）。
+* 补充了直接运行模型(run_model.py)的支持。
+
+## Version 2.0.1
+
+✅ Bug Fixed
+* 输出编码统一为utf-8。
+* 修复make_package中的错误。
+* 完善了视频读取非正常退出时的结束逻辑。
+
+✅ Modification
+* 可视化接口重构及通用性扩展。
+
+✅ Improvement(s)
+* 优化了deetector与collector中的参数计算逻辑，加速检测。
+
+## Version 2.0.0
+
+✅ Bug Fixed
+* 修复输出时间错位的问题
+* 修复ClipToolkit对单个输入的支持
+
+✅ New Feature(s)
+
+* 支持深度学习检测器：可使用ONNX框架下YOLO格式的网络作为检测器
+* 支持“重校验”选项：预测结果可以通过神经网络进行重校验，降低误报率
+* 预测结果新增类别，可支持对流星以外的天文或大气现象进行检测
+
+✅ Modification
+
+* 大量代码和API重构
+* config格式调整；不再兼容v1.x版本的config文件
+* 引入多种可选预设替代简单的"sensitivity"设置
+* 可视化接口分离
+* 项目许可证更换为MPL2.0许可证
+
+✅ Improvement(s)
+* 优化部分预设参数，改善默认检测模式下的运行效果。
+* 优化多线程视频读取和日志模块设计，完善退出时线程回收逻辑。
+* 优化估算SNR的计算流程。
+* 优化make_package在多平台和复杂环境下的打包稳定性。
+
+## Version 1.3.0
+
+✅ Bug Fixed
+
+* 修复了直线检测获取直线的数目问题，修复了多个流星同屏时的漏报问题。
+* 为流星收集器中引入“面积”类，改善了直线检测算法下对火流星的漏报的情况。
+* 其他的已知问题。
+
+✅ API改进
+
+* 命令行启动时的start-time与end-time参数现支持输入`HH:MM:SS.MS`格式的时间。
+* 调整检测的返回值：返回的JSON中的`pt1`与`pt2`将按顺序描述起止位置。
+* Some API of [config.json](../config.json) is modified and going to be merged or deprecated in the future. To keep compatibility, old API is reserved until `v2.0.0`. / 对 [config.json](../config.json) 的部分API进行了修改，先前版本的部分接口会在未来被合并或废弃。为保持兼容性，旧版本API会被保留至`v2.0.0`。
+* Some API of [config.json](../config.json) is modified and going to be merged or deprecated in the future. To keep compatibility, old API is reserved until `v2.0.0`. / 对 [config.json](../config.json) 的部分API进行了修改，先前版本的部分接口会在未来被合并或废弃。为保持兼容性，旧版本API会被保留至`v2.0.0`。
+
+✅ 算法改进
+
+* 简化了二值化前的图像增强方式
+* 增加了对检出直线的质量评定与非最大值抑制（NMS）机制
+* 增加了自适应gap
+* 增加了动态遮罩机制，优化了相机直录视频在星点附近的噪声
+* 引入面积响应，改善了容易排异火流星的情况
+* 完善了灵敏度相关的预设
+
+⚠️ 这些改进主要针对“标准”灵敏度，能够优化大量的误报，但会导致对一些暗弱流星的召回率降低。如果希望获得更高的召回率，可以在config中关闭对应设置，或启用灵敏度为“高”。
+
+✅ 评估脚本正式上线
+
+* 评估脚本能够自动根据标准加载视频，掩模以及标注，为对算法性能的定量分析提供支持。
+
+## Version 1.2.4
+
+✅ Fix bugs about MultithreadMetLog. / 修复了一些 `MultithreadMetLog` 模块的问题。
+
+✅ Some API of [config.json](../config.json) is modified and going to be merged or deprecated in the future. To keep compatibility, old API is reserved until `v2.0.0`. / 对 [config.json](../config.json) 的部分API进行了修改，先前版本的部分接口会在未来被合并或废弃。为保持兼容性，旧版本API会被保留至`v2.0.0`。
+
+## Version 1.2.3
+
+✅ [ClipToolkit.py](../ClipToolkit.py) related API is redesigned and updated. / 对 [ClipToolkit.py](../ClipToolkit.py) 脚本的API进行了重新设计与更新，简化了使用，提供了更多选项。
+
+✅ Introduce `MultithreadMetLog` module to manage output and logging. / 引入了 `MultithreadMetLog` 模块管理输出与日志。
+
+## Version 1.2.2
+
+✅ [ClipToolkit.py](../ClipToolkit.py) is available now. This script can be used to create several video clips or stacked images at once. See its usage for details. / 增加了 [ClipToolkit.py](../ClipToolkit.py)工具。该工具可用于一次性创建多个视频剪辑切片或堆栈图片。可参考其用法获取更多信息。
+
+✅ Update packaging script: modify the compile option to accelerate compiling speed(nuitka only); support using UPX to compress the size of executables;  support package multiple executables once. /更新打包脚本：修改编译选项以加速编译（Nuitka）；支持UPX压缩选项减小可执行文件大小；支持同时打包多个程序。
+
+✅ Bug fixed and code optimization. / 修复Bug，优化代码结构
+
+⚠️ Since this version, the output location of meteors is changed from running resolution to raw resolution. To keep compatibility, `video_size` is provided in the output JSON. / 从该版本开始，输出的流星位置将会从运行时分辨率调整为原始分辨率。为保持兼容性，输出原始分辨率的JSON会额外提供`video_size`键值。
+
+## Version 1.2.1
+
+✅ Bug fixed:
+    Fix the exception output of the start time under some conditions / 修复了部分情况下起始时间异常的问题；
+    Fix the exception abort issue during the FPS estimation / 修复了帧率估算时异常结束的问题；
+    Fix the infinite loop issue during the FPS estimation / 修复了帧率估算时Sigma裁剪均值无法收敛的问题.
+
+✅ Update packaging script: add Nuitka option, update spec file of pyinstaller. / 更新打包脚本：增加Nuitka打包选项，更新pyinstaller使用的.spec文件。
+
+✅ Formally release packaging version for linux and macOS platforms. / 正式发布macOS和linux平台的打包版本。
+
+## Version 1.2
+
+✅ Resolution-related APIs have been improved to support videos with different aspect ratios / 优化了分辨率相关接口以支持不同长宽比的视频
+
+✅ Implemented an adaptive binary threshold mechanism. We explored simple empirical relations between std and the binary threshold. (⚠️This may not be appropriate for all video patterns. If you encounter any issues, please feel free to modify the function or help me improve it:) / 实现根据方差计算的自适应二值化阈值
+
+✅ Sensitivity configuration is supported now: you can modify "sensitivity" under "bi_cfg" in config.json or passing arguments "--sensitivity {option}" to the program. / 增加灵敏度设置
+
+✅ Smoothing probabilities to [0,1] instead of {0,1}. Meteor judging now is by a series of factors so it could be more accurate (perhaps...). / 输出调整为概率形式
+
+## Version 1.1.1
+
+✅ Improved non-ASCII filename support for packaging version /改善对非ASCII文字路径的支持: by packaging with Python 3.7 and later, the new `pyinstaller` (>=5) can support non-ASCII paths and filenames.
+
+## Version 1.1.0
+
+✅ Add "Backend" mode to support MeteorMaster. / 增加了后端模式
+
+✅ Update output stream format. / 调整输出流格式
+
+## Version 1.0.0
+
+Initial Version / 初始版本
