@@ -2,17 +2,21 @@
 """批量筛选逻辑：扫描目录 → 逐图判定 → 归档（复制/移动/仅报告）。
 
 供 service.py（HTTP API）和 filter_cli.py（命令行）共用。
+支持多 ONNX session 并行推理（workers > 1 时吞吐量随 CPU 核数提升）。
 """
 from __future__ import annotations
 
 import csv
 import logging
 import os
+import queue
 import shutil
 import time
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Callable, Iterable, Optional
 
 from meteor_detector import MeteorDetector, draw_detections, imread_unicode, imwrite_unicode
 import cv2
@@ -22,6 +26,44 @@ logger = logging.getLogger("batch_filter")
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 # 输出目录名，扫描时跳过，避免重复处理
 OUTPUT_DIR_NAMES = {"meteor", "noise", "annotated"}
+
+
+def auto_workers() -> int:
+    """按 CPU 核数推荐并行 worker 数（每个 worker 独占一个 ONNX session）。"""
+    return max(1, min(8, (os.cpu_count() or 4) // 4))
+
+
+class DetectorPool:
+    """线程安全的检测器借用池：一个 session 同一时间只被一个线程使用。"""
+
+    def __init__(self, detectors: Iterable[MeteorDetector]):
+        self.detectors = list(detectors)
+        if not self.detectors:
+            raise ValueError("DetectorPool 需要至少一个检测器")
+        self._idle: queue.Queue = queue.Queue()
+        for d in self.detectors:
+            self._idle.put(d)
+
+    @property
+    def size(self) -> int:
+        return len(self.detectors)
+
+    @contextmanager
+    def borrow(self):
+        det = self._idle.get()
+        try:
+            yield det
+        finally:
+            self._idle.put(det)
+
+
+def build_pool(detector: MeteorDetector, workers: int,
+               factory: Callable[[], MeteorDetector] | None) -> DetectorPool:
+    """以 detector 为首实例构建池；workers>1 且给出 factory 时创建额外 session。"""
+    detectors = [detector]
+    if workers > 1 and factory is not None:
+        detectors.extend(factory() for _ in range(workers - 1))
+    return DetectorPool(detectors)
 
 
 def iter_images(input_dir: str | Path, recursive: bool = True) -> list[Path]:
@@ -66,6 +108,8 @@ class BatchResult:
     action: str = "none"  # copied/moved/kept/error
     error: str = ""
     detections: list = field(default_factory=list)
+    img: Optional[object] = field(default=None, repr=False, compare=False)
+    # img: 解码后的图像，供归档/画框复用，避免二次读盘；用完置 None 释放内存
 
 
 def classify_one(detector: MeteorDetector, path: Path, threshold: float) -> BatchResult:
@@ -80,6 +124,7 @@ def classify_one(detector: MeteorDetector, path: Path, threshold: float) -> Batc
     r.meteor_score = res["meteor_score"]
     r.n_detections = len(res["detections"])
     r.detections = res["detections"]
+    r.img = img
     if res["detections"]:
         top = max(res["detections"], key=lambda d: d["score"])
         r.top_class, r.top_score = top["class_name"], top["score"]
@@ -116,9 +161,9 @@ def archive_file(r: BatchResult, mode: str, meteor_dir: Optional[Path],
 
 
 def save_annotated_image(r: BatchResult, annotated_dir: Path, input_dir: Path) -> None:
-    """把带检测框的图片另存，便于人工抽查。"""
+    """把带检测框的图片另存，便于人工抽查（复用已解码图像，兼容 move 后源文件已移走）。"""
     try:
-        img = imread_unicode(r.path)
+        img = r.img if r.img is not None else imread_unicode(r.path)
         if img is None:
             return
         from meteor_detector import Detection
@@ -133,16 +178,42 @@ def save_annotated_image(r: BatchResult, annotated_dir: Path, input_dir: Path) -
         logger.warning("保存标注图失败 %s: %s", r.path, e)
 
 
+CSV_HEADER = ["文件", "有流星", "流星置信度", "最高分类别", "最高分",
+              "检测目标数", "处理动作", "错误信息"]
+
+
+def csv_row(r: BatchResult) -> list:
+    return [str(r.path), r.has_meteor, f"{r.meteor_score:.4f}",
+            r.top_class, f"{r.top_score:.4f}", r.n_detections,
+            r.action, r.error]
+
+
+class CsvReportWriter:
+    """增量 CSV 写入：每张图追加一行，避免整体重写的 O(n²) I/O，中断也留记录。"""
+
+    def __init__(self, csv_path: str | Path):
+        self.path = Path(csv_path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._f = open(self.path, "w", newline="", encoding="utf-8-sig")
+        self._w = csv.writer(self._f)
+        self._w.writerow(CSV_HEADER)
+        self._f.flush()
+
+    def write(self, r: BatchResult) -> None:
+        self._w.writerow(csv_row(r))
+        self._f.flush()
+
+    def close(self) -> None:
+        self._f.close()
+
+
 def write_csv_report(results: list[BatchResult], csv_path: Path) -> None:
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f)
-        w.writerow(["文件", "有流星", "流星置信度", "最高分类别", "最高分",
-                    "检测目标数", "处理动作", "错误信息"])
+        w.writerow(CSV_HEADER)
         for r in results:
-            w.writerow([str(r.path), r.has_meteor, f"{r.meteor_score:.4f}",
-                        r.top_class, f"{r.top_score:.4f}", r.n_detections,
-                        r.action, r.error])
+            w.writerow(csv_row(r))
 
 
 def run_batch(
@@ -157,12 +228,16 @@ def run_batch(
     files: Iterable[Path] | None = None,
     csv_path: str | Path | None = None,
     progress=None,                 # callable(done, total, result) 回调，可空
+    workers: int = 1,              # 并行推理 worker 数（>1 需提供 detector_factory）
+    detector_factory: Callable[[], MeteorDetector] | None = None,
 ) -> dict:
     """批量筛选一个目录。
 
     mode=report: 只判定不移动文件；
     mode=copy/move: 流星图归档到 meteor_dir，其余归档到 noise_dir
                     （默认为 input_dir 同级的 <目录名>_meteor / <目录名>_noise）。
+    workers>1 且给出 detector_factory 时并行推理（每个 worker 独占一个
+    ONNX session）；文件归档仍在主线程串行执行，保证结果顺序稳定。
     返回 {"results": [...], "summary": {...}}。
     """
     input_dir = Path(input_dir).resolve()
@@ -182,32 +257,49 @@ def run_batch(
         base = meteor_dir.parent if meteor_dir else input_dir.parent
         annotated_dir = base / "annotated"
 
+    pool = build_pool(detector, workers, detector_factory)
+    if pool.size > 1:
+        logger.info("并行模式: %d 个推理 worker", pool.size)
+
     results: list[BatchResult] = []
     n_meteor = n_noise = n_error = 0
     t_start = time.time()
-    for done, path in enumerate(file_list, 1):
-        try:
-            r = classify_one(detector, path, threshold)
-            if r.action != "error":
-                archive_file(r, mode, meteor_dir, noise_dir, input_dir)
-                if save_annotated and annotated_dir:
-                    save_annotated_image(r, annotated_dir, input_dir)
-        except Exception as e:
-            r = BatchResult(path=path, action="error", error=repr(e))
-        if r.action == "error":
-            n_error += 1
-        elif r.has_meteor:
-            n_meteor += 1
-        else:
-            n_noise += 1
-        results.append(r)
-        if progress:
-            try:
-                progress(done, len(file_list), r)
-            except Exception:
-                pass
-        if csv_path:
-            write_csv_report(results, Path(csv_path))  # 边跑边写，中断也留记录
+    csv_writer = CsvReportWriter(csv_path) if csv_path else None
+
+    def _classify(path: Path) -> BatchResult:
+        with pool.borrow() as det:
+            return classify_one(det, path, threshold)
+
+    try:
+        with ThreadPoolExecutor(max_workers=pool.size) as ex:
+            futures = [(p, ex.submit(_classify, p)) for p in file_list]
+            for done, (path, fut) in enumerate(futures, 1):
+                try:
+                    r = fut.result()
+                    if r.action != "error":
+                        archive_file(r, mode, meteor_dir, noise_dir, input_dir)
+                        if save_annotated and annotated_dir:
+                            save_annotated_image(r, annotated_dir, input_dir)
+                except Exception as e:
+                    r = BatchResult(path=path, action="error", error=repr(e))
+                r.img = None  # 释放解码图像
+                if r.action == "error":
+                    n_error += 1
+                elif r.has_meteor:
+                    n_meteor += 1
+                else:
+                    n_noise += 1
+                results.append(r)
+                if csv_writer:
+                    csv_writer.write(r)
+                if progress:
+                    try:
+                        progress(done, len(futures), r)
+                    except Exception:
+                        pass
+    finally:
+        if csv_writer:
+            csv_writer.close()
 
     summary = {
         "input_dir": str(input_dir),
@@ -217,12 +309,12 @@ def run_batch(
         "error": n_error,
         "mode": mode,
         "threshold": threshold,
+        "workers": pool.size,
         "elapsed_sec": round(time.time() - t_start, 2),
         "meteor_dir": str(meteor_dir) if meteor_dir else "",
         "noise_dir": str(noise_dir) if noise_dir else "",
     }
     if csv_path:
-        write_csv_report(results, Path(csv_path))
         summary["csv_report"] = str(csv_path)
     return {"results": results, "summary": summary}
 

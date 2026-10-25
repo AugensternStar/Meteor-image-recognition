@@ -18,6 +18,7 @@ from __future__ import annotations
 import base64
 import io
 import logging
+import threading
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
@@ -30,7 +31,7 @@ from pydantic import BaseModel, Field
 
 from meteor_detector import (MeteorDetector, POSITIVE_CLASSES, CLASSES,
                              Detection, draw_detections)
-from batch_filter import run_batch, result_to_json
+from batch_filter import run_batch, result_to_json, auto_workers
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -39,6 +40,9 @@ logger = logging.getLogger("meteor_service")
 MODEL_PATH = Path(__file__).parent / "weights" / "yolov5s_v2.onnx"
 
 detector: MeteorDetector | None = None
+
+# 批量任务互斥锁：防止并发 filter_folder 各建一组 session 导致 CPU 超额订阅
+_batch_lock = threading.Lock()
 
 
 @asynccontextmanager
@@ -139,6 +143,7 @@ class FolderRequest(BaseModel):
     threshold: float = 0.5
     recursive: bool = True
     save_annotated: bool = Field(False, description="额外保存画框图，便于人工抽查")
+    workers: int = Field(0, description="并行推理 worker 数（0=按 CPU 自动，1=单线程）")
 
 
 @app.post("/api/filter_folder")
@@ -146,19 +151,23 @@ def filter_folder(req: FolderRequest):
     """批量筛选服务器本地目录并自动归档，返回汇总与逐图明细。
 
     默认 mode=copy：流星图复制到 <input>_meteor/，其余复制到 <input>_noise/，
-    并在归档目录旁生成 CSV 报告。目录较多时耗时较长（CPU 约 0.2~2 秒/张），
+    并在归档目录旁生成 CSV 报告。workers>1 时多 ONNX session 并行推理。
     持续自动化建议使用 filter_cli.py --watch。
     """
     if req.mode not in ("report", "copy", "move"):
         raise HTTPException(400, "mode 只能是 report / copy / move")
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     csv_path = Path(req.input_dir).resolve().parent / f"filter_report_{stamp}.csv"
+    workers = req.workers if req.workers > 0 else auto_workers()
     try:
-        out = run_batch(detector, req.input_dir, mode=req.mode,
-                        meteor_dir=req.meteor_dir, noise_dir=req.noise_dir,
-                        threshold=req.threshold, recursive=req.recursive,
-                        save_annotated=req.save_annotated,
-                        csv_path=csv_path)
+        with _batch_lock:
+            out = run_batch(detector, req.input_dir, mode=req.mode,
+                            meteor_dir=req.meteor_dir, noise_dir=req.noise_dir,
+                            threshold=req.threshold, recursive=req.recursive,
+                            save_annotated=req.save_annotated,
+                            csv_path=csv_path,
+                            workers=workers,
+                            detector_factory=lambda: MeteorDetector(MODEL_PATH))
     except FileNotFoundError as e:
         raise HTTPException(400, str(e))
     return {

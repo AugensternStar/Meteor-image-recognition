@@ -44,6 +44,27 @@ POSITIVE_CLASSES = ("METEOR", "RED_SPRITE")  # 判定为"有流星/值得保留"
 
 PARTITION_MIN_OVERLAP = 0.2  # 多尺度切块时相邻块的最小重叠比例（与 MetDetPy 一致）
 
+# 推理后端优先级：CUDA > DirectML(任意 Windows GPU) > CPU。
+# 装了 onnxruntime-gpu / onnxruntime-directml 后自动启用，无需改代码。
+_PROVIDER_PRIORITY = ("CUDAExecutionProvider", "DmlExecutionProvider",
+                      "CPUExecutionProvider")
+
+
+def pick_providers(preferred: str | None = None) -> list[str]:
+    """按优先级选择可用的 ONNX Runtime 执行后端。"""
+    available = set(ort.get_available_providers())
+    if preferred:
+        candidates = [preferred]
+    else:
+        candidates = list(_PROVIDER_PRIORITY)
+    chosen = [p for p in candidates if p in available]
+    if not chosen:
+        chosen = ["CPUExecutionProvider"]
+    # GPU 后端之后补充 CPU 兜底，避免算子不支持时报错
+    if chosen != ["CPUExecutionProvider"] and "CPUExecutionProvider" in available:
+        chosen.append("CPUExecutionProvider")
+    return chosen
+
 
 def imread_unicode(path: str | Path):
     """读取图片，兼容 Windows 中文路径（cv2.imread 不支持非 ASCII 路径）。"""
@@ -131,6 +152,7 @@ class MeteorDetector:
         nms_thre: float = 0.45,
         hw_tolerance: float = 0.2,
         num_threads: int = 0,
+        providers: list[str] | None = None,
     ):
         if weight_path is None:
             weight_path = Path(__file__).parent / "weights" / "yolov5s_v2.onnx"
@@ -145,9 +167,10 @@ class MeteorDetector:
         session_options = ort.SessionOptions()
         if num_threads > 0:
             session_options.intra_op_num_threads = num_threads
+        self.providers = pick_providers() if providers is None else providers
         self.session = ort.InferenceSession(
             self.weight_path, sess_options=session_options,
-            providers=["CPUExecutionProvider"])
+            providers=self.providers)
         self.input_name = self.session.get_inputs()[0].name
         # 模型输入形如 [1, 3, 544, 960]
         self.batch, self.channels, self.h, self.w = self.session.get_inputs()[0].shape
@@ -156,8 +179,10 @@ class MeteorDetector:
         self._lock = threading.Lock()
         # 预热
         self._run_model(np.zeros((1, self.channels, self.h, self.w), np.float32))
-        logger.info("模型已加载: %s, 输入 %dx%d, 设备 CPU",
-                    self.weight_path, self.w, self.h)
+        device = "GPU" if any("CPU" not in p for p in self.providers) else "CPU"
+        logger.info("模型已加载: %s, 输入 %dx%d, 后端 %s (%s)",
+                    self.weight_path, self.w, self.h, device,
+                    ",".join(self.providers))
 
     # ------------------------------------------------------------------
     # 推理
@@ -169,14 +194,17 @@ class MeteorDetector:
         return out[0][0]
 
     def _forward_tile(self, x: np.ndarray):
-        """对一块已归一化的 float32 RGB 图 (H,W,3) 推理。
+        """对一块 uint8 RGB 图 (H,W,3) 推理（先缩放后转 float，省内存带宽）。
 
         返回 (boxes_xyxy_int, joint_scores)，坐标已映射回该块原始尺寸。
         """
         h, w = x.shape[:2]
         if h != self.h or w != self.w:
             x = cv2.resize(x, (self.w, self.h), interpolation=cv2.INTER_CUBIC)
-        tensor = np.ascontiguousarray(x.transpose(2, 0, 1))[None]
+        tensor = np.ascontiguousarray(
+            x.transpose(2, 0, 1)).astype(np.float32)
+        tensor *= np.float32(1.0 / 255.0)
+        tensor = tensor[None]
         results = self._run_model(tensor)
 
         # objectness 独立门槛：类别分数再高也救不了低 objectness 的框
@@ -198,11 +226,11 @@ class MeteorDetector:
         results, joint = results[selected], joint[selected]
 
         boxes = results[:, :4].copy()
-        # cxcywh -> xyxy
+        # cxcywh -> xyxy（x2/y2 必须由 x1/y1 加上宽高得到）
         boxes[:, 0] -= results[:, 2] / 2
-        boxes[:, 2] += results[:, 0]
         boxes[:, 1] -= results[:, 3] / 2
-        boxes[:, 3] += results[:, 1]
+        boxes[:, 2] = boxes[:, 0] + results[:, 2]
+        boxes[:, 3] = boxes[:, 1] + results[:, 3]
         # 映射回切块原始尺寸
         if h != self.h or w != self.w:
             boxes[:, 0] *= w / self.w
@@ -217,8 +245,7 @@ class MeteorDetector:
 
         if image_bgr.ndim == 2:
             image_bgr = cv2.cvtColor(image_bgr, cv2.COLOR_GRAY2BGR)
-        x = image_bgr[..., ::-1]  # BGR -> RGB（模型按 RGB 训练）
-        x = np.ascontiguousarray(x, np.float32) / 255.0
+        x = np.ascontiguousarray(image_bgr[..., ::-1])  # BGR -> RGB（模型按 RGB 训练）
 
         if self.multiscale_pred == 0:
             pos, joint = self._forward_tile(x)

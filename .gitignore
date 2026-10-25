@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.pyc
+
+# 临时诊断/测试产物（框坐标修复验证脚本与对比图，修复已合入主代码并记录于 README）
+.diag/
+.test_tmp/
+.bench/
+
+# 运行时生成的筛选报告
+filter_report_*.csv

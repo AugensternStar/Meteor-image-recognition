@@ -1,4 +1,7 @@
 onnxruntime>=1.16
+# GPU 加速（可选，二选一，装前先卸载 onnxruntime）：
+#   NVIDIA:              pip install onnxruntime-gpu
+#   任意 Windows 显卡:    pip install onnxruntime-directml
 opencv-python>=4.8
 numpy
 fastapi>=0.110
