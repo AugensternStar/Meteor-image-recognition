@@ -25,7 +25,7 @@ logger = logging.getLogger("batch_filter")
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 # 输出目录名，扫描时跳过，避免重复处理
-OUTPUT_DIR_NAMES = {"meteor", "noise", "annotated"}
+OUTPUT_DIR_NAMES = {"meteor", "noise", "review", "annotated"}
 
 
 def auto_workers() -> int:
@@ -108,6 +108,7 @@ class BatchResult:
     action: str = "none"  # copied/moved/kept/error
     error: str = ""
     detections: list = field(default_factory=list)
+    binned: str = ""      # 归档位置: meteor / review / noise（report 模式为空）
     img: Optional[object] = field(default=None, repr=False, compare=False)
     # img: 解码后的图像，供归档/画框复用，避免二次读盘；用完置 None 释放内存
 
@@ -132,16 +133,28 @@ def classify_one(detector: MeteorDetector, path: Path, threshold: float) -> Batc
 
 
 def archive_file(r: BatchResult, mode: str, meteor_dir: Optional[Path],
-                 noise_dir: Optional[Path], input_dir: Path) -> None:
-    """按判定结果复制/移动文件到对应目录，保持相对子路径。"""
+                 noise_dir: Optional[Path], input_dir: Path,
+                 review_dir: Optional[Path] = None,
+                 review_min: float = 0.0) -> None:
+    """按判定结果复制/移动文件到对应目录，保持相对子路径。
+
+    三档分流：has_meteor → meteor_dir；
+    review_min>0 且置信度落在 [review_min, threshold) → review_dir（待人工复核）；
+    其余 → noise_dir。
+    """
     if r.action == "error":
         return  # 读取失败的文件不归档
     if mode not in ("copy", "move"):
         r.action = "kept"
         return
-    dst_root = meteor_dir if r.has_meteor else noise_dir
+    if r.has_meteor:
+        dst_root, r.binned = meteor_dir, "meteor"
+    elif review_min > 0 and r.meteor_score >= review_min and review_dir is not None:
+        dst_root, r.binned = review_dir, "review"
+    else:
+        dst_root, r.binned = noise_dir, "noise"
     if dst_root is None:
-        r.action = "kept"
+        r.action, r.binned = "kept", ""
         return
     rel = r.path.relative_to(input_dir)
     dst = dst_root / rel
@@ -157,7 +170,7 @@ def archive_file(r: BatchResult, mode: str, meteor_dir: Optional[Path],
             shutil.move(str(r.path), dst)
             r.action = "moved"
     except OSError as e:
-        r.action, r.error = "error", str(e)
+        r.action, r.error, r.binned = "error", str(e), ""
 
 
 def save_annotated_image(r: BatchResult, annotated_dir: Path, input_dir: Path) -> None:
@@ -179,12 +192,13 @@ def save_annotated_image(r: BatchResult, annotated_dir: Path, input_dir: Path) -
 
 
 CSV_HEADER = ["文件", "有流星", "流星置信度", "最高分类别", "最高分",
-              "检测目标数", "处理动作", "错误信息"]
+              "检测目标数", "归档位置", "处理动作", "错误信息"]
 
 
 def csv_row(r: BatchResult) -> list:
     return [str(r.path), r.has_meteor, f"{r.meteor_score:.4f}",
             r.top_class, f"{r.top_score:.4f}", r.n_detections,
+            r.binned or ("meteor" if r.has_meteor else "noise"),
             r.action, r.error]
 
 
@@ -230,12 +244,16 @@ def run_batch(
     progress=None,                 # callable(done, total, result) 回调，可空
     workers: int = 1,              # 并行推理 worker 数（>1 需提供 detector_factory）
     detector_factory: Callable[[], MeteorDetector] | None = None,
+    review_min: float = 0.0,       # 复核带下限（0=关闭）；[review_min, threshold) 待人工复核
+    review_dir: str | Path | None = None,
 ) -> dict:
     """批量筛选一个目录。
 
     mode=report: 只判定不移动文件；
     mode=copy/move: 流星图归档到 meteor_dir，其余归档到 noise_dir
                     （默认为 input_dir 同级的 <目录名>_meteor / <目录名>_noise）。
+    review_min>0 时置信度落在 [review_min, threshold) 的图片归档到 review_dir
+    （默认 <目录名>_review），避免把暗弱流星直接判为非流星而丢失。
     workers>1 且给出 detector_factory 时并行推理（每个 worker 独占一个
     ONNX session）；文件归档仍在主线程串行执行，保证结果顺序稳定。
     返回 {"results": [...], "summary": {...}}。
@@ -250,8 +268,14 @@ def run_batch(
         meteor_dir = input_dir.parent / f"{input_dir.name}_meteor"
     if (mode in ("copy", "move")) and noise_dir is None:
         noise_dir = input_dir.parent / f"{input_dir.name}_noise"
+    if review_min > 0 and review_dir is None:
+        review_dir = input_dir.parent / f"{input_dir.name}_review"
     meteor_dir = Path(meteor_dir).resolve() if meteor_dir else None
     noise_dir = Path(noise_dir).resolve() if noise_dir else None
+    review_dir = Path(review_dir).resolve() if review_dir else None
+    if review_min > 0 and review_min >= threshold:
+        review_min = 0.0  # 配置不合理时关闭复核带
+        logger.warning("review_min >= threshold，复核带已关闭")
     annotated_dir = None
     if save_annotated:
         base = meteor_dir.parent if meteor_dir else input_dir.parent
@@ -262,7 +286,7 @@ def run_batch(
         logger.info("并行模式: %d 个推理 worker", pool.size)
 
     results: list[BatchResult] = []
-    n_meteor = n_noise = n_error = 0
+    n_meteor = n_review = n_noise = n_error = 0
     t_start = time.time()
     csv_writer = CsvReportWriter(csv_path) if csv_path else None
 
@@ -277,7 +301,8 @@ def run_batch(
                 try:
                     r = fut.result()
                     if r.action != "error":
-                        archive_file(r, mode, meteor_dir, noise_dir, input_dir)
+                        archive_file(r, mode, meteor_dir, noise_dir, input_dir,
+                                     review_dir=review_dir, review_min=review_min)
                         if save_annotated and annotated_dir:
                             save_annotated_image(r, annotated_dir, input_dir)
                 except Exception as e:
@@ -286,8 +311,13 @@ def run_batch(
                 if r.action == "error":
                     n_error += 1
                 elif r.has_meteor:
+                    r.binned = r.binned or "meteor"
                     n_meteor += 1
+                elif review_min > 0 and r.meteor_score >= review_min:
+                    r.binned = r.binned or "review"
+                    n_review += 1
                 else:
+                    r.binned = r.binned or "noise"
                     n_noise += 1
                 results.append(r)
                 if csv_writer:
@@ -305,13 +335,16 @@ def run_batch(
         "input_dir": str(input_dir),
         "total": len(results),
         "meteor": n_meteor,
+        "review": n_review,
         "noise": n_noise,
         "error": n_error,
         "mode": mode,
         "threshold": threshold,
+        "review_min": review_min,
         "workers": pool.size,
         "elapsed_sec": round(time.time() - t_start, 2),
         "meteor_dir": str(meteor_dir) if meteor_dir else "",
+        "review_dir": str(review_dir) if review_dir and review_min > 0 else "",
         "noise_dir": str(noise_dir) if noise_dir else "",
     }
     if csv_path:
@@ -328,6 +361,7 @@ def result_to_json(r: BatchResult) -> dict:
         "top_class": r.top_class,
         "top_score": round(r.top_score, 4),
         "n_detections": r.n_detections,
+        "binned": r.binned,
         "action": r.action,
         "error": r.error,
         "detections": r.detections,

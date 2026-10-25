@@ -13,10 +13,11 @@ CPU 即可运行），推理流程（多尺度切块 + 类别感知 NMS + sqrt(o
 
 ```
 meteor_filter/
-├── meteor_detector.py    # 核心检测模块（可独立 import）
-├── batch_filter.py       # 批量筛选共享逻辑
+├── meteor_detector.py    # 核心检测模块（可独立 import，支持区域掩码）
+├── batch_filter.py       # 批量筛选共享逻辑（并行、复核带、CSV 报告）
 ├── service.py            # HTTP API 服务（FastAPI，含网页测试界面）
 ├── filter_cli.py         # 命令行批量筛选 / 目录监听模式
+├── evaluate.py           # 准确率评估（基于 MetDetPy 标注测试视频）
 ├── start_server.bat      # 双击启动 API 服务
 ├── weights/yolov5s_v2.onnx
 ├── requirements.txt
@@ -116,6 +117,9 @@ python filter_cli.py --input D:\captures\live --mode move --watch --interval 15
 #   --threshold 0.5     正类阈值（误检多调高，漏检多调低）
 #   --multiscale 0      0=最快（约0.1s/张） / 2=默认最准（小流星召回更好）
 #   --workers N         并行推理 worker 数（0=自动按 CPU 核数，1=单线程）
+#   --review-min 0.35   复核带下限：置信度 [0.35, 0.5) 的图进 <input>_review/
+#                       待人工确认，防止暗弱流星被直接判为非流星（0=关闭）
+#   --mask mask.png     区域掩码（白=检测，黑=忽略），排除建筑/灯光固定误检区
 #   --save-annotated    额外输出画框图
 ```
 
@@ -129,9 +133,39 @@ python filter_cli.py --input D:\captures\live --mode move --watch --interval 15
   `JET`、`RARE_SPRITE`、`SPACECRAFT`、`BUGS`（飞虫）。
 - **判定为"有流星"的条件**：存在 METEOR 或 RED_SPRITE 类目标，且置信度
   （sqrt(objectness×类别分)）≥ `threshold`（默认 0.5）。
+- 置信度落在 `[review-min, threshold)` 的图片归档到 `<input>_review/`
+  待人工复核——实测模型的分数呈两极分布（真流星 0.85+，无目标接近 0），
+  边界分数罕见，复核带通常只有少量图片，人工确认成本很低。
+- 若固定场景（建筑、地平线灯、树影）反复误检，用 `--mask` 画一张掩码
+  （白=检测区，黑=忽略区）即可一劳永逸。
 - 所有检测结果（含飞机、飞虫等负类）都会返回，可据此统计误检来源。
-- 若白天/强月光场景误检偏多，优先调高 threshold 至 0.6~0.7；
-  暗弱流星被漏检时降至 0.35~0.4，并用 `--save-annotated` 人工抽查。
+
+## 准确率评估（evaluate.py）
+
+基于 MetDetPy 标注测试视频（4K、25fps、1 个流星事件）的帧级实测：
+
+| multiscale | 召回率 | 真误报 | 说明 |
+|---|---|---|---|
+| 0（整图一次） | 81.8% | 0 | 漏掉流星出现初期较暗的帧 |
+| 2（默认） | **90.9%** | 0 | 检出全部可见帧，定位 10/10 全中 |
+
+- 阈值在 0.3~0.7 区间对召回几乎无影响（真流星分数 0.85+，呈两极分布），
+  因此**调阈值不是提升召回的有效手段**，multiscale 档位才是。
+- 标注窗口外的"检出"经核实为**流星余迹**（persistent train，位置与真值
+  重合、持续到 7.6s），不计为误报——模型实际表现优于原始数字。
+- 测试集只有 1 个流星事件，以上数字用于相对对比与回归验证，改动后可运行
+  `python evaluate.py --sweep-multiscale` 快速复测。
+
+### 继续提升正确率的路线
+
+1. **复核带 + 人工反馈（零成本）**：默认已开启。人工把 review 目录里的
+   真流星挑回 meteor 目录，同时就是积累标注数据。
+2. **区域掩码（针对固定误检）**：`--mask` 排除建筑/灯光区域。
+3. **自有数据微调（根治域差异，收益最大）**：模型在夜间监控视频域训练，
+   自己相机/合成图的风格可能有差异。积累几百张本项目的误检/漏检图片
+   （review 目录和 `--save-annotated` 输出即天然标注素材），用
+   YOLOv5 同结构（输入 960×544）微调后替换 `weights/yolov5s_v2.onnx`，
+   代码无需改动。每次换权重后跑 `evaluate.py` 回归。
 
 ## 性能（本机 CPU 实测，20 核，multiscale=2，1080p）
 
@@ -154,6 +188,16 @@ python filter_cli.py --input D:\captures\live --mode move --watch --interval 15
 
 ## 变更记录
 
+- 2026-10-25（二）准确率专项
+  - 新增 `evaluate.py` 准确率评估工具：基于 MetDetPy 标注视频量化
+    召回/误报，支持 multiscale 对比与阈值扫描；发现标注窗外"误报"
+    实为流星余迹（位置与真值重合），已按余迹单独归类。
+  - 新增复核带 `--review-min`（默认 0.35）：置信度 [0.35, 0.5) 的图片
+    归档到 `<input>_review/` 待人工确认，防止暗弱流星被直接判为非流星。
+  - 新增区域掩码 `--mask`：排除建筑/灯光等固定误检区域（MetDetPy 同款能力）。
+  - 修复 `meteor_score` 语义：此前低于阈值时返回 0，现返回真实最高正类分数。
+  - 实测结论：multiscale=2 召回 90.9%、真误报 0；阈值 0.3~0.7 对召回
+    几乎无影响，调阈值不是提升召回的手段（详见「准确率评估」）。
 - 2026-10-25
   - 修复检测框 cxcywh→xyxy 转换错误（x2/y2 偏大半个宽高，画框与 NMS 受影响）。
   - 修复 watch 模式漏文件：写入中的文件曾被永久跳过，现会自动重试。

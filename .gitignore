@@ -6,6 +6,8 @@ __pycache__/
 .diag/
 .test_tmp/
 .bench/
+.t/
+.eval_frames/
 
 # 运行时生成的筛选报告
 filter_report_*.csv

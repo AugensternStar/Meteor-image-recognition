@@ -47,6 +47,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--workers", type=int, default=0,
                    help="并行推理 worker 数（0=按 CPU 核数自动，1=单线程；"
                         "多 worker 会各建一个 ONNX session 提高吞吐）")
+    p.add_argument("--review-min", type=float, default=0.35,
+                   help="复核带下限（默认 0.35）：置信度落在 [review-min, threshold) "
+                        "的图片归档到待复核目录而非直接判非流星，防漏检；0=关闭")
+    p.add_argument("--review-dir", default=None,
+                   help="待复核图归档目录（默认 <input>_review）")
+    p.add_argument("--mask", default=None,
+                   help="有效区域掩码图片（白=检测，黑=忽略），用于排除建筑/灯光等"
+                        "固定误检区域；尺寸任意，自动缩放")
     return p
 
 
@@ -63,18 +71,21 @@ def run_once(detector: MeteorDetector, args, factory) -> None:
     csv_path = input_dir.parent / f"filter_report_{datetime.now():%Y%m%d_%H%M%S}.csv"
     workers = args.workers if args.workers > 0 else auto_workers()
     print(f"开始筛选: {input_dir}  模式={args.mode}  阈值={args.threshold}  "
-          f"workers={workers}")
+          f"workers={workers}  复核带>={args.review_min}")
     out = run_batch(detector, input_dir, mode=args.mode,
                     meteor_dir=args.meteor_dir, noise_dir=args.noise_dir,
                     threshold=args.threshold, recursive=not args.no_recursive,
                     save_annotated=args.save_annotated,
                     csv_path=csv_path, progress=print_progress,
-                    workers=workers, detector_factory=factory)
+                    workers=workers, detector_factory=factory,
+                    review_min=args.review_min, review_dir=args.review_dir)
     s = out["summary"]
     print("-" * 60)
-    print(f"完成：共 {s['total']} 张 | 流星 {s['meteor']} | 非流星 {s['noise']} | "
-          f"错误 {s['error']} | 耗时 {s['elapsed_sec']}s")
+    print(f"完成：共 {s['total']} 张 | 流星 {s['meteor']} | 待复核 {s['review']} | "
+          f"非流星 {s['noise']} | 错误 {s['error']} | 耗时 {s['elapsed_sec']}s")
     print(f"流星目录: {s['meteor_dir'] or '（仅报告模式）'}")
+    if s.get("review_dir"):
+        print(f"复核目录: {s['review_dir']}")
     print(f"CSV 报告: {s.get('csv_report', '')}")
 
 
@@ -86,6 +97,9 @@ def run_watch(detector: MeteorDetector, args, factory) -> None:
         else input_dir.parent / f"{input_dir.name}_meteor"
     noise_dir = Path(args.noise_dir).resolve() if args.noise_dir \
         else input_dir.parent / f"{input_dir.name}_noise"
+    review_dir = Path(args.review_dir).resolve() if args.review_dir \
+        else input_dir.parent / f"{input_dir.name}_review"
+    review_min = min(args.review_min, args.threshold) if args.review_min > 0 else 0.0
     mode = args.mode if args.mode != "report" else "move"  # 监听模式下归档才有意义
     workers = args.workers if args.workers > 0 else auto_workers()
     pool = build_pool(detector, workers, factory)
@@ -93,6 +107,8 @@ def run_watch(detector: MeteorDetector, args, factory) -> None:
     max_retries = 3  # 解码失败的文件最多重试次数（可能是写入中被误判为稳定）
     print(f"监听模式: 每 {args.interval}s 扫描 {input_dir}（workers={pool.size}）")
     print(f"流星图 → {meteor_dir}")
+    if review_min > 0:
+        print(f"待复核（{review_min}~{args.threshold}）→ {review_dir}")
     print(f"非流星图 → {noise_dir}   (Ctrl+C 退出)")
     seen: set[Path] = set(iter_images(input_dir, not args.no_recursive))
     if seen:
@@ -128,11 +144,12 @@ def run_watch(detector: MeteorDetector, args, factory) -> None:
                 if r.action == "error":
                     print(f"[错误] {r.path.name}: {r.error}", flush=True)
                     continue
-                archive_file(r, mode, meteor_dir, noise_dir, input_dir)
+                archive_file(r, mode, meteor_dir, noise_dir, input_dir,
+                             review_dir=review_dir, review_min=review_min)
                 if args.save_annotated:
                     save_annotated_image(r, annotated_dir, input_dir)
                 r.img = None
-                mark = "✔流星" if r.has_meteor else "·无"
+                mark = "✔流星" if r.has_meteor else ("?复核" if r.binned == "review" else "·无")
                 print(f"{datetime.now():%H:%M:%S} {mark} {r.meteor_score:.2f} "
                       f"{r.path.name} → {r.action}", flush=True)
     except KeyboardInterrupt:
@@ -149,7 +166,8 @@ def main():
 
     def factory() -> MeteorDetector:
         return MeteorDetector(multiscale_pred=args.multiscale,
-                              num_threads=threads_per)
+                              num_threads=threads_per,
+                              mask_path=args.mask)
 
     detector = factory()
     if args.watch:

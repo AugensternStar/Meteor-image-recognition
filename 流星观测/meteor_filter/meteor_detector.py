@@ -153,6 +153,7 @@ class MeteorDetector:
         hw_tolerance: float = 0.2,
         num_threads: int = 0,
         providers: list[str] | None = None,
+        mask_path: str | Path | None = None,
     ):
         if weight_path is None:
             weight_path = Path(__file__).parent / "weights" / "yolov5s_v2.onnx"
@@ -183,6 +184,37 @@ class MeteorDetector:
         logger.info("模型已加载: %s, 输入 %dx%d, 后端 %s (%s)",
                     self.weight_path, self.w, self.h, device,
                     ",".join(self.providers))
+        self.region_mask: Optional[np.ndarray] = None
+        if mask_path:
+            self.set_mask(mask_path)
+
+    def set_mask(self, mask_path: str | Path) -> None:
+        """设置有效区域掩码（白=检测有效，黑=忽略，如建筑/地平线灯）。
+
+        掩码尺寸任意，检测时自动缩放到图片大小；检测框中心落在黑色
+        区域内的目标将被丢弃。传不存在路径会抛错以便及早发现配置问题。
+        """
+        m = imread_unicode(mask_path)
+        if m is None:
+            raise ValueError(f"无法读取掩码图片: {mask_path}")
+        self.region_mask = cv2.cvtColor(m, cv2.COLOR_BGR2GRAY) \
+            if m.ndim == 3 else m
+        logger.info("已启用区域掩码: %s (有效区占比 %.1f%%)", mask_path,
+                    100.0 * (self.region_mask >= 128).mean())
+
+    def _apply_region_mask(self, detections: list, h: int, w: int) -> list:
+        """丢弃检测框中心落在掩码黑色区域内的目标。"""
+        if not detections or self.region_mask is None:
+            return detections
+        mask = self.region_mask
+        if mask.shape[:2] != (h, w):
+            mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
+        keep = []
+        for d in detections:
+            cx, cy = (d.x1 + d.x2) // 2, (d.y1 + d.y2) // 2
+            if mask[max(0, min(h - 1, cy)), max(0, min(w - 1, cx))] >= 128:
+                keep.append(d)
+        return keep
 
     # ------------------------------------------------------------------
     # 推理
@@ -261,7 +293,7 @@ class MeteorDetector:
                 x1=int(max(0, box[0])), y1=int(max(0, box[1])),
                 x2=int(min(w, box[2])), y2=int(min(h, box[3])),
                 score=float(sc[cid]), class_id=cid, class_name=name))
-        return detections
+        return self._apply_region_mask(detections, h, w)
 
     def _multiscale_forward(self, x: np.ndarray, h: int, w: int):
         """多尺度切块推理（与 MetDetPy YOLOModel.forward 相同的切图策略）。
@@ -346,17 +378,17 @@ class MeteorDetector:
 
         返回:
             {
-              "has_meteor": bool,
-              "meteor_score": float,   # 最高的正类置信度（无正类目标时为 0）
-              "detections": [...],     # 全部检测目标（含飞机/飞虫等负类）
+              "has_meteor": bool,     # 存在正类目标且分数 ≥ threshold
+              "meteor_score": float,  # 最高正类置信度（无正类目标时为 0；
+                                      # 与 threshold 无关，供复核带等使用）
+              "detections": [...],    # 全部检测目标（含飞机/飞虫等负类）
             }
         """
         detections = self.detect(image_bgr)
-        positives = [d for d in detections
-                     if d.is_positive and d.score >= threshold]
-        positives.sort(key=lambda d: d.score, reverse=True)
+        positives = sorted((d for d in detections if d.is_positive),
+                           key=lambda d: d.score, reverse=True)
         return {
-            "has_meteor": len(positives) > 0,
+            "has_meteor": bool(positives) and positives[0].score >= threshold,
             "meteor_score": positives[0].score if positives else 0.0,
             "detections": [d.to_dict() for d in detections],
         }

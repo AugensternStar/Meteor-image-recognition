@@ -144,6 +144,11 @@ class FolderRequest(BaseModel):
     recursive: bool = True
     save_annotated: bool = Field(False, description="额外保存画框图，便于人工抽查")
     workers: int = Field(0, description="并行推理 worker 数（0=按 CPU 自动，1=单线程）")
+    review_min: float = Field(0.0, description="复核带下限（0=关闭）；"
+                              "置信度 [review_min, threshold) 归档到待复核目录")
+    review_dir: str | None = Field(None, description="待复核图归档目录（默认 自动）")
+    mask: str | None = Field(None, description="有效区域掩码图片路径（白=检测，黑=忽略），"
+                            "排除建筑/灯光等固定误检区")
 
 
 @app.post("/api/filter_folder")
@@ -151,8 +156,9 @@ def filter_folder(req: FolderRequest):
     """批量筛选服务器本地目录并自动归档，返回汇总与逐图明细。
 
     默认 mode=copy：流星图复制到 <input>_meteor/，其余复制到 <input>_noise/，
-    并在归档目录旁生成 CSV 报告。workers>1 时多 ONNX session 并行推理。
-    持续自动化建议使用 filter_cli.py --watch。
+    review_min>0 时置信度边界图归档到 <input>_review/ 待人工复核。
+    mask 给定时，检测框中心落在掩码黑色区域的目标被忽略。
+    workers>1 时多 ONNX session 并行推理。持续自动化建议使用 filter_cli.py --watch。
     """
     if req.mode not in ("report", "copy", "move"):
         raise HTTPException(400, "mode 只能是 report / copy / move")
@@ -167,7 +173,9 @@ def filter_folder(req: FolderRequest):
                             save_annotated=req.save_annotated,
                             csv_path=csv_path,
                             workers=workers,
-                            detector_factory=lambda: MeteorDetector(MODEL_PATH))
+                            detector_factory=lambda: MeteorDetector(
+                                MODEL_PATH, mask_path=req.mask),
+                            review_min=req.review_min, review_dir=req.review_dir)
     except FileNotFoundError as e:
         raise HTTPException(400, str(e))
     return {
